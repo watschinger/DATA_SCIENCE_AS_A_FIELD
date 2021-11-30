@@ -1,0 +1,182 @@
+---
+title: "Shooting Incidents NYC"
+author: "----"
+date: "11/25/2021"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library("stringr")
+library("tidyverse")
+library("lubridate")
+library("maps")
+library(mapproj)
+```
+
+## Load Data
+For this report we use data from the Data Repository of the US government. We load one csv file.
+
+```{r get_NYPD_data}
+## Get current Data 
+url <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+
+```
+
+With this url we now read in the data.
+
+```{r import_data, message=FALSE}
+NYPD <- read_csv(url)
+```
+We use glimps and given that we immediately observe many NAs we check for missing values using sapply. As a next step we convert OCCUR_DATE to date.
+```{r inspect_data}
+glimpse(NYPD)
+NYPD %>%
+  summarise(count = sum(is.na(NYPD)))
+  sapply(NYPD, function(x) sum(is.na(x)))
+
+#Convert date chr to date    
+NYPD <- NYPD %>% mutate(OCCUR_DATE = mdy(OCCUR_DATE))
+```
+Data quality is overall good. The fact that perpetrator data is missing seems reasonable, it would be interesting by what criteria the data is provided (can it be based on testimonies, or are only identified (arrested) perpetrators considered?)
+
+## Geospatial Display
+We want to better understand where those shootings occured and therefore display incidents as dots on a ggplot map (entire history available) 
+
+```{r geo_incidents}
+### get all counties of the State of New York and filter for the 5 boroughs of New York City
+counties <- map_data("county","New York")
+counties <- as_tibble(counties)
+nyc <- c("bronx", "kings","new york", "queens", "richmond")
+counties <- counties %>%
+  filter(subregion %in% nyc)
+
+### rename the counties to borough names
+ counties <- counties %>% 
+   mutate(subregion = replace(subregion, subregion == "kings", "brooklyn")) %>%
+   mutate(subregion = replace(subregion, subregion == "richmond", "staten island")) %>%
+   mutate(subregion = replace(subregion, subregion == "new york", "manhattan"))
+ 
+# create centered names for the map 
+cnames <- aggregate(cbind(long, lat) ~ subregion, data=counties,FUN=function(x)mean(range(x))) 
+
+#plot the map of NYC 
+ggplot(counties, aes(long, lat)) +  
+    geom_polygon(aes(group=group), colour='black', fill=NA) +
+    geom_text(data=cnames, aes(long, lat, label = subregion), size=5) +
+    coord_map() + 
+  geom_point(data = NYPD, aes(x = Longitude, y = Latitude), size = 1, 
+        shape = 21, fill = "darkred")
+```
+
+
+There are simply too many data points and given that we want to visualize other attributes provided in the report as well, we display data just for one year.
+
+```{r geo_incidents_2019}
+#plot the map of NYC and shootings for selected year
+
+NYPD_selected <- NYPD %>% filter(OCCUR_DATE > "2018-12-31" & OCCUR_DATE < "2020-01-01")
+NYPD_selected_black <- NYPD_selected %>% filter(VIC_RACE == "BLACK")
+NYPD_selected_black_hispanic <- NYPD_selected %>% filter(VIC_RACE == "BLACK HISPANIC")
+NYPD_selected_white <- NYPD_selected %>% filter(VIC_RACE == "WHITE")
+NYPD_selected_white_hispanic <- NYPD_selected %>% filter(VIC_RACE == "WHITE HISPANIC")
+  ggplot(counties, aes(long, lat)) +  
+    geom_polygon(aes(group=group), colour='black', fill=NA) +
+    geom_text(data=cnames, aes(long, lat, label = subregion), size=2) +
+    coord_map() + 
+  geom_point(data = NYPD_selected_black, aes(x = Longitude, y = Latitude), size = 1, 
+        shape = 21, fill = "black") + 
+  geom_point(data = NYPD_selected_black_hispanic, aes(x = Longitude, y = Latitude), size = 1, 
+        shape = 21, fill = "red") + geom_point(data = NYPD_selected_white_hispanic, aes(x = Longitude, y = Latitude), size = 1, 
+        shape = 21, fill = "yellow") + geom_point(data = NYPD_selected_white, aes(x = Longitude, y = Latitude), size = 1, 
+        shape = 21, fill = "green") 
+```
+
+We marked the data by race of the victims:
+* black dots stand for blacks 
+* red for black hispanics
+* green for whites and 
+* yellow for white hispanics. 
+
+Overall we see incidents spread widely accross all NYC, with staten island being less affected. Obviously black and white hispanic together with black hispanic persons represent the vast majority of victims. 
+
+## Time Series
+Now we are going to group the data by race of victim and plot the timeseries. 
+```{r race}
+#select INCIDENT_KEY, OCCUR_DATE, BORO, PERP RACE and VIC RACE
+NYPD_race <- NYPD %>% select ("INCIDENT_KEY","OCCUR_DATE", "VIC_RACE") %>%
+  mutate(OCCUR_DATE = format(OCCUR_DATE, "%Y")) %>%
+  group_by(OCCUR_DATE, VIC_RACE) %>%
+  summarise(n = n()) %>%
+  mutate(prop = n / sum(n))
+
+#Plot the timeseries
+ggplot(NYPD_race,aes(x=OCCUR_DATE, y=prop, group=VIC_RACE, color=VIC_RACE)) +
+    geom_line() +
+  ggtitle("Race of victims 2006-2020") +
+    
+    ylab("proportion") + xlab("year")
+```
+
+The high percentage of black victims is striking. Given that according to the demographic data provided by data.io the biggest group by race is white (non-hispanic) with 32% contrasted by just 22% black - demographic data obviously does not explain the distribution of victims by race in the shooting incident report.
+
+## Model the missing perpetrator race using a multinomial regression with categorical predictors
+
+We saw that more than 8000 records did not show the perpetrators race. But we observed in addition to the high percentage of black victims also a very high share of black perpetrators. In general same race incidents where perpetrator has the same race as the victim prevails for all races (except for BLACK HISPANICS).
+
+Please see a summary below:
+```{r race_perp_vic, message = FALSE}
+#PERP RACE and VIC RACE
+NYPD_race_total <- NYPD %>% select ("INCIDENT_KEY","OCCUR_DATE", "PERP_RACE", "VIC_RACE") %>%
+  mutate(OCCUR_DATE = format(OCCUR_DATE, "%Y")) %>%
+  group_by(PERP_RACE, VIC_RACE) %>%
+  summarise(n = n()) %>%
+  mutate(prop = n / sum(n))
+NYPD_race_total %>% print(n = Inf)
+```
+
+Using a model will help to understand if based on the data available shooting incidents involving people of same race are highly likely.
+We load again the full data set and will use borough, race of victim and sex of victim to predict the race of the perpetrator.
+
+```{r logistic_regression, message=FALSE}
+url <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+data.raw <- read.csv(url, stringsAsFactors = TRUE)
+keeps <- c("PERP_RACE", "BORO", "VIC_RACE", "VIC_SEX")
+data.raw <- data.raw[keeps]
+train <- filter(data.raw, data.raw$PERP_RACE == "BLACK" | data.raw$PERP_RACE == "WHITE" | data.raw$PERP_RACE == "WHITE HISPANIC" | data.raw$PERP_RACE == "BLACK HISPANIC" | data.raw$PERP_RACE == "ASIAN / PACIFIC ISLANDER")
+#Train the model
+train <- droplevels(train)
+
+model <- nnet::multinom(PERP_RACE ~., data = train)
+print(summary(model))
+# Make predictions
+predicted.classes <- model %>% predict(train)
+head(predicted.classes)
+# Model accuracy
+mean(predicted.classes == train$PERP_RACE)
+data.raw$predicted.PERP_RACE<-model %>% predict(data.raw)
+head(data.raw)
+```
+Please see below the grouped data using the predicted perpetrator race:
+
+```{r race_perp_vic_predicted, message = FALSE}
+data.raw.tbl <- tibble(data.raw)
+#PERP RACE PREDICTED and VIC RACE
+NYPD_race_total_predicted <- data.raw.tbl %>% select ("predicted.PERP_RACE","PERP_RACE", "VIC_RACE") %>%
+  group_by(predicted.PERP_RACE,VIC_RACE) %>%
+  summarise(n = n()) %>%
+  mutate(prop = n / sum(n))
+NYPD_race_total_predicted %>% print(n = Inf)
+```
+
+Model accuracy on training data was just 74%, therefore results need to be interpreted cautiously. Nevertheless we see that the percentage of incidents with a black perpetrator and a black victims stays almost the same as for the original data. For white perpetrators and hispanic perpetrators the model predicts a 100% probabiltiy that the victim is of the same race.
+
+## Bias
+Being a non-US citizen my bias is driven by news coverage of gun-violence and crime by various international media. In the recent month the focus in the news was on police violence against black people. Regarding the analysis, I personally believe that the statistics of the NYPD, especially when it comes to race of victims are credible. There might be a bias when it comes to perpetrators. Nevertheless the observed high percentage of black persons being either victim or perpetrator is known in the US as black-on-black violence phenomenon. The latter one gets supported by the model (multinomial regression with categorical predictors) performed aboved. The shooting incidents are obviously not related to the demographic composition of NYC by race.
+
+
+```{r session}
+sessionInfo()
+```
